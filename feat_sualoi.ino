@@ -162,7 +162,10 @@ void startPortal()
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
 
-  while (true) server.handleClient();
+  while (true) {
+    server.handleClient();
+    delay(2);
+  }
 }
 
 bool connectWiFi()
@@ -312,6 +315,7 @@ void loop()
     mqttConnect();
   }
   mqttClient.loop();
+  yield();
 
   if (relayOn && relayOffAtMs > 0 && (long)(millis() - relayOffAtMs) >= 0) {
     setRelayState(false);
@@ -396,6 +400,7 @@ void loop()
       json.set("total_volume_L", totalVolumeL);
       json.set("datetime", datetimeStr);
       Firebase.setJSON(fbdo, path, json);
+      yield();
 
       Serial.println("--- 5m AVG SENT ---");
       Serial.print("Avg T=");
