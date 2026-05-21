@@ -27,7 +27,7 @@
 #define MQTT_TOPIC_STATUS "irrigation/status/pump"
 
 // ===== RELAY =====
-#define RELAY_PIN 26
+#define RELAY_PIN 33
 #define RELAY_ON_LEVEL HIGH
 #define RELAY_OFF_LEVEL LOW
 
