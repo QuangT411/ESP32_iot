@@ -27,11 +27,11 @@
 #define MQTT_TOPIC_STATUS "irrigation/status/pump"
 
 // ===== RELAY =====
-#define RELAY_PIN 33
+#define RELAY_PIN 25
 #define RELAY_ON_LEVEL HIGH
 #define RELAY_OFF_LEVEL LOW
 
-FirebaseData fbdo;
+FirebaseData fbdo; 
 FirebaseAuth auth;
 FirebaseConfig config;
 
@@ -43,6 +43,9 @@ unsigned long relayDurationMs = 0;
 unsigned long relayOffAtMs = 0;
 unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RECONNECT_MS = 5000;
+
+unsigned long lastWiFiAttemptMs = 0;
+const unsigned long WIFI_RECONNECT_MS = 5000;
 
 unsigned long lastSend = 0;
 
@@ -56,8 +59,8 @@ Adafruit_BME280 bme;
 BH1750 lightMeter;
 
 // ===== SOIL =====
-const int AirValue   = 3220;
-const int WaterValue = 2100;
+const int AirValue   = 3000;
+const int WaterValue = 1750;
 const int SensorPin  = 34;
 
 int soilMoistureValue  = 0;
@@ -298,6 +301,8 @@ void setup()
   initLight();
   initBME280();
   initWiFi();
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
   initFirebase();
 
   mqttWifiClient.setInsecure();
@@ -310,6 +315,11 @@ void setup()
 // ===== LOOP =====
 void loop()
 {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiAttemptMs >= WIFI_RECONNECT_MS) {
+    lastWiFiAttemptMs = millis();
+    WiFi.reconnect();
+  }
+
   if (!mqttClient.connected() && millis() - lastMqttAttemptMs >= MQTT_RECONNECT_MS) {
     lastMqttAttemptMs = millis();
     mqttConnect();
