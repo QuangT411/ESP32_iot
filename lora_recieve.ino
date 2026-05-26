@@ -1,11 +1,3 @@
-// ===================================================================
-//  lora_recieve.ino — Gateway Node (trong nhà)
-//  - Nhận data cảm biến từ lora_send qua LoRa SX1278 (433MHz)
-//  - Gửi data lên Firebase Realtime Database
-//  - Kết nối WiFi (EEPROM Portal) + MQTT
-//  - Nhận lệnh điều khiển bơm từ app qua MQTT → forward qua LoRa
-//    về lora_send để bật/tắt relay
-// ===================================================================
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -20,7 +12,6 @@
 #include <addons/RTDBHelper.h>
 #include <PubSubClient.h>
 #include <time.h>
-#include <esp_task_wdt.h>
 
 // ===== LoRa SX1278 (433MHz) =====
 #define LORA_NSS   5
@@ -156,7 +147,6 @@ bool connectWiFi()
   WiFi.begin(ssid, pass);
   int timeout = 20;
   while (WiFi.status() != WL_CONNECTED && timeout--) {
-    esp_task_wdt_reset();
     delay(500);
     Serial.print(".");
   }
@@ -219,7 +209,6 @@ void sendToFirebase(float t, float h, float p, float lux,
   json.set("total_volume_L", vol);
   json.set("datetime",       datetime);
 
-  esp_task_wdt_reset();
   if (Firebase.setJSON(fbdo, path, json)) {
     Serial.println("✅ Firebase OK → " + String(datetime));
   } else {
@@ -374,11 +363,6 @@ void setup()
   Serial.begin(115200);
   EEPROM.begin(512);
 
-  // Watchdog
-  esp_task_wdt_init(15, true);
-  esp_task_wdt_add(NULL);
-  Serial.println("✅ Watchdog OK (timeout=15s)");
-
   // WiFi
   initWiFi();
   WiFi.setAutoReconnect(true);
@@ -407,8 +391,6 @@ void setup()
 // ===================================================================
 void loop()
 {
-  esp_task_wdt_reset();
-
   // --- WiFi tự kết nối lại khi mất ---
   if (WiFi.status() != WL_CONNECTED &&
       millis() - lastWiFiAttemptMs >= WIFI_RECONNECT_MS) {
