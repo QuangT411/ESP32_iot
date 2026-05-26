@@ -173,6 +173,7 @@ void startPortal()
   while (true) {
     server.handleClient();
     delay(2);
+    yield();
   }
 }
 
@@ -184,6 +185,7 @@ bool connectWiFi()
   int timeout = 20;
   while (WiFi.status() != WL_CONNECTED && timeout--) {
     delay(500);
+    yield();
     Serial.print(".");
   }
   Serial.println();
@@ -202,6 +204,7 @@ void initWiFi()
     Serial.println("    Reset ESP32 sau khi cài WiFi để kết nối lại.");
     offlineMode = true;
   }
+  yield();
 }
 
 //  SD CARD 
@@ -254,6 +257,7 @@ void saveToSD(float t, float h, float p, float lux, float soil,
   f.printf("%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
            datetime, t, h, p, lux, soil, flow, vol);
   f.close();
+  yield();
 
   Serial.print("💾 Lưu offline → ");
   Serial.println(filename);
@@ -335,6 +339,7 @@ void mqttConnect()
     Serial.print("MQTT connect failed, rc=");
     Serial.println(mqttClient.state());
   }
+  yield();
 }
 void initI2C()    { Wire.begin(21, 22); }
 void initLight()  { lightMeter.begin(); }
@@ -357,6 +362,7 @@ int readSoilMedianPercent9()
   for (int i = 0; i < 9; i++) {
     values[i] = readSoilRaw();
     if (i < 8) delay(100);
+    yield();
   }
 
   for (int i = 1; i < 9; i++) {
@@ -515,8 +521,8 @@ void loop()
       Serial.println("--- 💾 READ → SD Card (offline) ---");
     }
 
-    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3f Vol=%.3f\n",
-                  t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
+   Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%d%% Flow=%.3f Vol=%.3f\n",
+              t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
 
     lastSend = millis();
   }
