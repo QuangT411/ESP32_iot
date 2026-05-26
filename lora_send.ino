@@ -7,7 +7,6 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <SD.h>
-#include <esp_task_wdt.h>
 
 // ===== LoRa SX1278 (433MHz) =====
 #define LORA_NSS   5
@@ -52,64 +51,43 @@ unsigned long relayOffAtMs    = 0;
 Adafruit_BME280 bme;
 BH1750          lightMeter;
 
-// ===== SAMPLING / SEND =====
-unsigned long lastSampleMs = 0;
+// ===== SEND =====
 unsigned long lastSendMs   = 0;
-const unsigned long SENSOR_SAMPLE_MS = 15000;   // 15 giây
 const unsigned long SEND_WINDOW_MS   = 300000;  // 5 phút
 
-float sumT = 0, sumH = 0, sumP = 0, sumLux = 0;
-int   soilSamples[30];
-int   sampleCount = 0;
-
 // ===================================================================
-//  MEDIAN FILTER — lọc nhiễu cảm biến đất
+//  SOIL MEDIAN(9) — raw -> median -> map
 // ===================================================================
-#define MEDIAN_SAMPLES 11  // số lẻ để có giá trị giữa rõ ràng
-
-int readSoilMedian()
+int readSoilRaw()
 {
-  int buf[MEDIAN_SAMPLES];
-
-  // Thu thập mẫu
-  for (int i = 0; i < MEDIAN_SAMPLES; i++) {
-    buf[i] = analogRead(SensorPin);
-    delay(2);
-  }
-
-  // Sắp xếp tăng dần (insertion sort — nhỏ gọn cho mảng ngắn)
-  for (int i = 1; i < MEDIAN_SAMPLES; i++) {
-    int key = buf[i];
-    int j   = i - 1;
-    while (j >= 0 && buf[j] > key) {
-      buf[j + 1] = buf[j];
-      j--;
-    }
-    buf[j + 1] = key;
-  }
-
-  return buf[MEDIAN_SAMPLES / 2];  // giá trị giữa
+  return analogRead(SensorPin);
 }
 
-// Tính Median cho một mảng số nguyên
-float getMedian(int arr[], int n)
+int mapSoilPercent(int soilRaw)
 {
-  // Sắp xếp tăng dần (insertion sort)
-  for (int i = 1; i < n; i++) {
-    int key = arr[i];
-    int j   = i - 1;
-    while (j >= 0 && arr[j] > key) {
-      arr[j + 1] = arr[j];
-      j--;
-    }
-    arr[j + 1] = key;
+  int soilPercent = map(soilRaw, AirValue, WaterValue, 0, 100);
+  return constrain(soilPercent, 0, 100);
+}
+
+int readSoilMedianPercent9()
+{
+  int values[9];
+  for (int i = 0; i < 9; i++) {
+    values[i] = readSoilRaw();
+    if (i < 8) delay(100);
   }
 
-  if (n % 2 == 1) {
-    return arr[n / 2];
-  } else {
-    return (arr[n / 2 - 1] + arr[n / 2]) / 2.0;
+  for (int i = 1; i < 9; i++) {
+    int key = values[i];
+    int j = i - 1;
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = key;
   }
+
+  return mapSoilPercent(values[4]);
 }
 
 // ===================================================================
@@ -149,7 +127,6 @@ void saveToSD(float t, float h, float p, float lux, float soil,
     return;
   }
 
-  esp_task_wdt_reset();  // tránh watchdog khi SD card chậm
   f.printf("%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f\n",
            t, h, p, lux, soil, flow, vol);
   f.close();
@@ -267,11 +244,6 @@ void setup()
 {
   Serial.begin(115200);
 
-  // Watchdog
-  esp_task_wdt_init(15, true);
-  esp_task_wdt_add(NULL);
-  Serial.println("✅ Watchdog OK (timeout=15s)");
-
   // GPIO
   pinMode(RELAY_PIN, OUTPUT);
   setRelayState(false);
@@ -293,7 +265,6 @@ void setup()
   // LoRa
   initLoRa();
 
-  lastSampleMs = millis();
   lastSendMs   = millis();
   lastMeasureMs = millis();
 }
@@ -303,8 +274,6 @@ void setup()
 // ===================================================================
 void loop()
 {
-  esp_task_wdt_reset();
-
   // --- Lắng nghe lệnh bơm từ lora_recieve ---
   checkLoRaCommand();
 
@@ -330,57 +299,20 @@ void loop()
     totalVolumeL += pulses / (CALIBRATION_FACTOR * 60.0f);
   }
 
-  // --- Sample cảm biến mỗi 15 giây ---
-  if (millis() - lastSampleMs >= SENSOR_SAMPLE_MS) {
-    lastSampleMs = millis();
-
-    // Đọc soil moisture: Median Filter 11 mẫu — chống spike hoàn toàn
-    int soilRaw     = readSoilMedian();
-    int soilPercent = map(soilRaw, AirValue, WaterValue, 0, 100);
-    soilPercent     = constrain(soilPercent, 0, 100);
+  // --- READ BME/BH1750 ONCE + SOIL MEDIAN(9) mỗi 5 phút ---
+  if (millis() - lastSendMs >= SEND_WINDOW_MS) {
+    int soilMedian = readSoilMedianPercent9();
 
     float t   = bme.readTemperature();
     float h   = bme.readHumidity();
     float p   = bme.readPressure() / 100.0F;
     float lux = lightMeter.readLightLevel();
 
-    if (sampleCount < 30) {
-      soilSamples[sampleCount] = soilPercent;
-    }
-    sumT    += t;
-    sumH    += h;
-    sumP    += p;
-    sumLux  += lux;
-    sampleCount++;
+    sendSensorData(t, h, p, lux, soilMedian);
+    saveToSD(t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
 
-    Serial.printf("Sample #%d | T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%d%% Flow=%.3fL/m\n",
-                  sampleCount, t, h, p, lux, soilPercent, flowRateLMin);
-  }
-
-  // --- Gửi trung bình 5 phút qua LoRa ---
-  if (millis() - lastSendMs >= SEND_WINDOW_MS && sampleCount > 0) {
-    float avgT    = sumT    / sampleCount;
-    float avgH    = sumH    / sampleCount;
-    float avgP    = sumP    / sampleCount;
-    float avgLux  = sumLux  / sampleCount;
-
-    // Tính median cho độ ẩm đất (soil moisture) sau 5 phút
-    int validSamples = (sampleCount > 30) ? 30 : sampleCount;
-    float medianSoil = getMedian(soilSamples, validSamples);
-
-    // 1. Gửi qua LoRa
-    sendSensorData(avgT, avgH, avgP, avgLux, medianSoil);
-
-    // 2. Luôn lưu vào SD Card
-    saveToSD(avgT, avgH, avgP, avgLux, medianSoil, flowRateLMin, totalVolumeL);
-
-    Serial.println("--- 📊 5m Summary (Soil uses Median Filter) ---");
-    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
-                  avgT, avgH, avgP, avgLux, medianSoil, flowRateLMin, totalVolumeL);
-
-    // Reset bộ tích lũy
-    sumT = sumH = sumP = sumLux = 0;
-    sampleCount = 0;
+  Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%d%% Flow=%.3f Vol=%.3f\n",
+              t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
     lastSendMs  = millis();
   }
 
