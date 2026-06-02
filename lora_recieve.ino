@@ -13,79 +13,73 @@
 #include <PubSubClient.h>
 #include <time.h>
 
-// ===== LoRa SX1278 (433MHz) =====
-#define LORA_NSS   5
-#define LORA_RST   14
-#define LORA_DIO0  2
-#define LORA_FREQ  433E6
+// LoRa SX1278 (433MHz) 
+#define LORA_NSS 5
+#define LORA_RST 14
+#define LORA_DIO0 2
+#define LORA_FREQ 433E6
 
 // ===== FIREBASE =====
-#define DATABASE_URL  "https://precise-irrigation-6c076-default-rtdb.firebaseio.com/"
+#define DATABASE_URL "https://precise-irrigation-6c076-default-rtdb.firebaseio.com/"
 #define FIREBASE_AUTH "GrpnZk7sHKPaDkZn1oo4EiWvdUwBsqvuSYS7Lv5b"
 
-// ===== MQTT (EMQX CLOUD) =====
-#define MQTT_HOST         "ba662f8f.ala.asia-southeast1.emqxsl.com"
-#define MQTT_PORT         8883
-#define MQTT_USER         "quang"
-#define MQTT_PASS         "12052004"
-#define MQTT_TOPIC_PUMP   "irrigation/control/pump"
-#define MQTT_TOPIC_TIME   "irrigation/control/time"
+//MQTT (EMQX CLOUD) 
+#define MQTT_HOST "ba662f8f.ala.asia-southeast1.emqxsl.com"
+#define MQTT_PORT 8883
+#define MQTT_USER "quang"
+#define MQTT_PASS "12052004"
+#define MQTT_TOPIC_PUMP "irrigation/control/pump"
+#define MQTT_TOPIC_TIME "irrigation/control/time"
 #define MQTT_TOPIC_STATUS "irrigation/status/pump"
 
-// ===== FIREBASE =====
-FirebaseData   fbdo;
-FirebaseAuth   auth;
+//  FIREBASE 
+FirebaseData fbdo;
+FirebaseAuth auth;
 FirebaseConfig config;
 
-// ===== MQTT =====
+//  MQTT 
 WiFiClientSecure mqttWifiClient;
-PubSubClient     mqttClient(mqttWifiClient);
+PubSubClient mqttClient(mqttWifiClient);
 
-bool          pumpOn          = false;  // trạng thái bơm (dùng để publish MQTT status)
-unsigned long relayDurationMs = 0;      // thời gian bơm chạy (ms)
+bool pumpOn = false;                // trạng thái bơm (dùng để publish MQTT status)
+unsigned long relayDurationMs = 0;  // thời gian bơm chạy (ms)
 
-unsigned long lastMqttAttemptMs  = 0;
+unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RECONNECT_MS = 5000;
 
-unsigned long lastWiFiAttemptMs  = 0;
+unsigned long lastWiFiAttemptMs = 0;
 const unsigned long WIFI_RECONNECT_MS = 5000;
 
 bool offlineMode = false;
 
 // ===== NTP =====
-const char* ntpServer          = "pool.ntp.org";
-const long  gmtOffset_sec      = 7 * 3600;
-const int   daylightOffset_sec = 0;
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600;
+const int daylightOffset_sec = 0;
 
 // ===== WIFI PORTAL (EEPROM) =====
 WebServer server(80);
 char ssid[32];
 char pass[32];
 
-// ===================================================================
 //  EEPROM — lưu/đọc WiFi credentials
-// ===================================================================
-void saveCredentials(const char* newSSID, const char* newPass)
-{
-  for (int i = 0; i < 32; i++) EEPROM.write(0   + i, newSSID[i]);
+void saveCredentials(const char* newSSID, const char* newPass) {
+  for (int i = 0; i < 32; i++) EEPROM.write(0 + i, newSSID[i]);
   for (int i = 0; i < 32; i++) EEPROM.write(100 + i, newPass[i]);
   EEPROM.commit();
 }
 
-bool readCredentials()
-{
-  for (int i = 0; i < 32; i++) ssid[i] = EEPROM.read(0   + i);
+bool readCredentials() {
+  for (int i = 0; i < 32; i++) ssid[i] = EEPROM.read(0 + i);
   for (int i = 0; i < 32; i++) pass[i] = EEPROM.read(100 + i);
   ssid[31] = '\0';
   pass[31] = '\0';
   return (ssid[0] != '\0' && (uint8_t)ssid[0] != 0xFF);
 }
 
-// ===================================================================
 //  WIFI CAPTIVE PORTAL
-// ===================================================================
-void handleRoot()
-{
+
+void handleRoot() {
   String html = R"(
     <!DOCTYPE html><html><head>
     <meta charset='UTF-8'>
@@ -116,23 +110,21 @@ void handleRoot()
   server.send(200, "text/html", html);
 }
 
-void handleSave()
-{
+void handleSave() {
   String newSSID = server.arg("ssid");
   String newPass = server.arg("pass");
   saveCredentials(newSSID.c_str(), newPass.c_str());
   server.send(200, "text/html",
-    "<h2 style='font-family:Arial;text-align:center;margin-top:40px'>"
-    "✅ Đã lưu! ESP32 đang restart...</h2>");
+              "<h2 style='font-family:Arial;text-align:center;margin-top:40px'>"
+              "✅ Đã lưu! ESP32 đang restart...</h2>");
   delay(2000);
   ESP.restart();
 }
 
-void startPortal()
-{
+void startPortal() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP("ESP32_GATEWAY");
-  server.on("/",     HTTP_GET,  handleRoot);
+  server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
   Serial.println("📶 AP Portal chạy tại 192.168.4.1 (SSID: ESP32_GATEWAY)");
@@ -141,8 +133,7 @@ void startPortal()
     delay(2);
   }
 }
-bool connectWiFi()
-{
+bool connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, pass);
   int timeout = 20;
@@ -154,8 +145,7 @@ bool connectWiFi()
   return WiFi.status() == WL_CONNECTED;
 }
 
-void initWiFi()
-{
+void initWiFi() {
   if (readCredentials() && connectWiFi()) {
     Serial.println("✅ WiFi OK: " + WiFi.localIP().toString());
     offlineMode = false;
@@ -165,11 +155,8 @@ void initWiFi()
   }
 }
 
-// ===================================================================
 //  LORA INIT
-// ===================================================================
-void initLoRa()
-{
+void initLoRa() {
   LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("❌ LoRa khởi tạo thất bại! Kiểm tra kết nối dây.");
@@ -182,12 +169,9 @@ void initLoRa()
   Serial.println("✅ LoRa OK (433MHz, SF9, BW125, CR4/5)");
 }
 
-// ===================================================================
 //  FIREBASE
-// ===================================================================
-void initFirebase()
-{
-  config.database_url               = DATABASE_URL;
+void initFirebase() {
+  config.database_url = DATABASE_URL;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.begin(&config, &auth);
   Firebase.reconnectNetwork(true);
@@ -195,19 +179,18 @@ void initFirebase()
 
 void sendToFirebase(float t, float h, float p, float lux,
                     float soil, float flow, float vol,
-                    const char* datetime, time_t nowEpoch)
-{
+                    const char* datetime, time_t nowEpoch) {
   String path = "/He_thong_tuoi/sensors/data/" + String(nowEpoch);
 
   FirebaseJson json;
-  json.set("temperature",    t);
-  json.set("humidity",       h);
-  json.set("pressure_hpa",   p);
-  json.set("soil_percent",   soil);
-  json.set("light_lux",      lux);
-  json.set("flow_L_min",     flow);
+  json.set("temperature", t);
+  json.set("humidity", h);
+  json.set("pressure_hpa", p);
+  json.set("soil_percent", soil);
+  json.set("light_lux", lux);
+  json.set("flow_L_min", flow);
   json.set("total_volume_L", vol);
-  json.set("datetime",       datetime);
+  json.set("datetime", datetime);
 
   if (Firebase.setJSON(fbdo, path, json)) {
     Serial.println("✅ Firebase OK → " + String(datetime));
@@ -217,15 +200,12 @@ void sendToFirebase(float t, float h, float p, float lux,
   yield();
 }
 
-// ===================================================================
 //  GỬI LỆNH BƠM QUA LORA → LORA_SEND
-// ===================================================================
-void sendPumpCommand(const char* state, long durSeconds)
-{
+void sendPumpCommand(const char* state, long durSeconds) {
   StaticJsonDocument<128> doc;
-  doc["cmd"]   = "PUMP";
+  doc["cmd"] = "PUMP";
   doc["state"] = state;
-  doc["dur"]   = durSeconds;
+  doc["dur"] = durSeconds;
 
   String payload;
   serializeJson(doc, payload);
@@ -244,11 +224,8 @@ void sendPumpCommand(const char* state, long durSeconds)
   }
 }
 
-// ===================================================================
 //  MQTT CALLBACK — nhận lệnh từ app, forward qua LoRa
-// ===================================================================
-void mqttCallback(char* topic, byte* payload, unsigned int length)
-{
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
   Serial.print("=> MQTT [");
   Serial.print(topic);
   Serial.print("]: ");
@@ -264,15 +241,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
   msg.trim();
 
   if (strcmp(topic, MQTT_TOPIC_PUMP) == 0) {
-    bool isOn = (msg == "ON" ||
-                 msg.indexOf("\"status\":\"ON\"")  >= 0 ||
-                 msg.indexOf("\"status\": \"ON\"") >= 0);
-    bool isOff = (msg == "OFF" ||
-                  msg.indexOf("\"status\":\"OFF\"")  >= 0 ||
-                  msg.indexOf("\"status\": \"OFF\"") >= 0);
+    bool isOn = (msg == "ON" || msg.indexOf("\"status\":\"ON\"") >= 0 || msg.indexOf("\"status\": \"ON\"") >= 0);
+    bool isOff = (msg == "OFF" || msg.indexOf("\"status\":\"OFF\"") >= 0 || msg.indexOf("\"status\": \"OFF\"") >= 0);
 
     if (isOn) {
-      sendPumpCommand("ON",  relayDurationMs / 1000);
+      sendPumpCommand("ON", relayDurationMs / 1000);
     } else if (isOff) {
       sendPumpCommand("OFF", 0);
     }
@@ -290,8 +263,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
   }
 }
 
-void mqttConnect()
-{
+void mqttConnect() {
   if (mqttClient.connected()) return;
   String clientId = "ESP32_Gateway_" + String(random(0xffff), HEX);
   if (mqttClient.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
@@ -308,8 +280,7 @@ void mqttConnect()
 // ===================================================================
 //  NHẬN DATA CẢM BIẾN TỪ LORA_SEND → GỬI FIREBASE
 // ===================================================================
-void checkLoRaData()
-{
+void checkLoRaData() {
   int packetSize = LoRa.parsePacket();
   if (packetSize == 0) return;
 
@@ -332,19 +303,19 @@ void checkLoRaData()
     return;
   }
 
-  float t    = doc["t"]    | 0.0f;
-  float h    = doc["h"]    | 0.0f;
-  float p    = doc["p"]    | 0.0f;
-  float lux  = doc["lux"]  | 0.0f;
+  float t = doc["t"] | 0.0f;
+  float h = doc["h"] | 0.0f;
+  float p = doc["p"] | 0.0f;
+  float lux = doc["lux"] | 0.0f;
   float soil = doc["soil"] | 0.0f;
   float flow = doc["flow"] | 0.0f;
-  float vol  = doc["vol"]  | 0.0f;
+  float vol = doc["vol"] | 0.0f;
 
   Serial.printf("   T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
                 t, h, p, lux, soil, flow, vol);
 
   if (!offlineMode && Firebase.ready()) {
-    time_t   nowEpoch = time(nullptr);
+    time_t nowEpoch = time(nullptr);
     struct tm ti;
     localtime_r(&nowEpoch, &ti);
     char dt[20];
@@ -355,11 +326,8 @@ void checkLoRaData()
   }
 }
 
-// ===================================================================
-//  SETUP
-// ===================================================================
-void setup()
-{
+
+void setup() {
   Serial.begin(115200);
   EEPROM.begin(512);
 
@@ -389,11 +357,9 @@ void setup()
 // ===================================================================
 //  LOOP
 // ===================================================================
-void loop()
-{
+void loop() {
   // --- WiFi tự kết nối lại khi mất ---
-  if (WiFi.status() != WL_CONNECTED &&
-      millis() - lastWiFiAttemptMs >= WIFI_RECONNECT_MS) {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiAttemptMs >= WIFI_RECONNECT_MS) {
     lastWiFiAttemptMs = millis();
     WiFi.reconnect();
   }
@@ -403,8 +369,7 @@ void loop()
 
   // --- MQTT ---
   if (!offlineMode) {
-    if (!mqttClient.connected() &&
-        millis() - lastMqttAttemptMs >= MQTT_RECONNECT_MS) {
+    if (!mqttClient.connected() && millis() - lastMqttAttemptMs >= MQTT_RECONNECT_MS) {
       lastMqttAttemptMs = millis();
       mqttConnect();
     }
