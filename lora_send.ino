@@ -29,6 +29,10 @@ bool sdAvailable = false;
 const int AirValue   = 3000;
 const int WaterValue = 1750;
 const int SensorPin  = 34;
+const float SOIL_ALPHA = 0.2f;
+float soilFilteredRaw = 0.0f;
+bool  soilFilteredInit = false;
+int   lastSoilRaw = -1;
 
 // ===== FLOW METER =====
 const int   FLOW_PIN           = 27;
@@ -49,7 +53,7 @@ unsigned long relayOffAtMs    = 0;
 
 // ===== SENSOR =====
 Adafruit_BME280 bme;
-BH1750          lightMeter;
+BH1750  lightMeter;
 
 // ===== SEND =====
 unsigned long lastSendMs   = 0;
@@ -63,13 +67,13 @@ int readSoilRaw()
   return analogRead(SensorPin);
 }
 
-int mapSoilPercent(int soilRaw)
+float mapSoilPercentF(float soilRaw)
 {
-  int soilPercent = map(soilRaw, AirValue, WaterValue, 0, 100);
-  return constrain(soilPercent, 0, 100);
+  float pct = (AirValue - soilRaw) / (float)(AirValue - WaterValue) * 100.0f;
+  return constrain(pct, 0.0f, 100.0f);
 }
 
-int readSoilMedianPercent9()
+int readSoilMedianRaw9()
 {
   int values[9];
   for (int i = 0; i < 9; i++) {
@@ -87,8 +91,9 @@ int readSoilMedianPercent9()
     values[j + 1] = key;
   }
 
-  return mapSoilPercent(values[4]);
+  return values[4];
 }
+
 
 // ===================================================================
 //  SD CARD
@@ -195,9 +200,6 @@ void sendSensorData(float t, float h, float p, float lux, float soil)
   Serial.println(payload);
 }
 
-// ===================================================================
-//  NHẬN LỆNH BƠM TỪ LORA_RECIEVE
-// ===================================================================
 void checkLoRaCommand()
 {
   int packetSize = LoRa.parsePacket();
@@ -301,18 +303,39 @@ void loop()
 
   // --- READ BME/BH1750 ONCE + SOIL MEDIAN(9) mỗi 5 phút ---
   if (millis() - lastSendMs >= SEND_WINDOW_MS) {
-    int soilMedian = readSoilMedianPercent9();
+    int soilMedianRaw = readSoilMedianRaw9();
+
+    float alpha = SOIL_ALPHA;
+    if (lastSoilRaw >= 0) {
+      int deltaAdc = lastSoilRaw - soilMedianRaw;
+      if (deltaAdc >= 100) {
+        alpha = 0.8f;
+      }
+    }
+
+    if (!soilFilteredInit) {
+      soilFilteredRaw = (float)soilMedianRaw;
+      soilFilteredInit = true;
+    } else {
+      soilFilteredRaw = alpha * (float)soilMedianRaw + (1.0f - alpha) * soilFilteredRaw;
+    }
+
+    lastSoilRaw = soilMedianRaw;
+
+    float soilPercent = mapSoilPercentF(soilFilteredRaw);
+    soilPercent = roundf(soilPercent * 100.0f) / 100.0f;
 
     float t   = bme.readTemperature();
     float h   = bme.readHumidity();
     float p   = bme.readPressure() / 100.0F;
     float lux = lightMeter.readLightLevel();
 
-    sendSensorData(t, h, p, lux, soilMedian);
-    saveToSD(t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
+    sendSensorData(t, h, p, lux, soilPercent);
+    saveToSD(t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
 
-  Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%d%% Flow=%.3f Vol=%.3f\n",
-              t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
+    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
+            t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
+
     lastSendMs  = millis();
   }
 
