@@ -77,9 +77,12 @@ const int SensorPin  = 34;
 
 int soilMoistureValue  = 0;
 int soilmoisturepercent = 0;
-
+const float SOIL_ALPHA = 0.2f;
+float soilFilteredRaw = 0.0f;
+bool  soilFilteredInit = false;
+int   lastSoilRaw = -1;
 // ===== FLOW =====
-const int   FLOW_PIN           = 27;
+const int   FLOW_PIN           = 33;
 const float CALIBRATION_FACTOR = 98.0;
 
 volatile unsigned long pulseCount   = 0;
@@ -215,7 +218,7 @@ void initSD()
     Serial.println("✅ SD Card OK");
   } else {
     sdAvailable = false;
-    Serial.println("⚠️  SD Card FAIL — không có fallback storage");
+    Serial.println("⚠️  SD Card FAIL e");
   }
 }
 
@@ -350,13 +353,7 @@ int readSoilRaw()
   return analogRead(SensorPin);
 }
 
-int mapSoilPercent(int soilRaw)
-{
-  int soilPercent = map(soilRaw, AirValue, WaterValue, 0, 100);
-  return constrain(soilPercent, 0, 100);
-}
-
-int readSoilMedianPercent9()
+int readSoilMedianRaw9()
 {
   int values[9];
   for (int i = 0; i < 9; i++) {
@@ -375,14 +372,21 @@ int readSoilMedianPercent9()
     values[j + 1] = key;
   }
 
-  return mapSoilPercent(values[4]);
+  return values[4];
 }
+
+float mapSoilPercentF(float soilRaw)
+{
+  float pct = (AirValue - soilRaw) / (float)(AirValue - WaterValue) * 100.0f;
+  return constrain(pct, 0.0f, 100.0f);
+}
+
 void initMqtt()
 {
   mqttWifiClient.setInsecure();
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
-  Serial.println("✅ MQTT config OK (chưa connect, sẽ connect trong loop)");
+  Serial.println("✅ MQTT config");
 }
 
 
@@ -497,35 +501,54 @@ void loop()
   }
 
   // --- READ BME/BH1750 ONCE + SOIL MEDIAN(9) mỗi 5 phút ---
-  if (millis() - lastSend >= SEND_WINDOW_MS) {
-    int soilMedian = readSoilMedianPercent9();
+if (millis() - lastSend >= SEND_WINDOW_MS) {
+  int soilMedianRaw = readSoilMedianRaw9();
 
-    float t   = bme.readTemperature();
-    float h   = bme.readHumidity();
-    float p   = bme.readPressure() / 100.0F;
-    float lux = readLight();
-
-    time_t   nowEpoch = time(nullptr);
-    struct tm ti;
-    localtime_r(&nowEpoch, &ti);
-    char dt[20];
-    strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M:%S", &ti);
-
-    if (!offlineMode && Firebase.ready()) {
-      sendToFirebase(t, h, p, lux, soilMedian, dt, nowEpoch);
-      Serial.println("--- ✅ 5m READ → Firebase ---");
-    } else {
-      // --- OFFLINE: lưu vào SD Card ---
-      saveToSD(t, h, p, lux, soilMedian,
-               flowRateLMin, totalVolumeL, dt);
-      Serial.println("--- 💾 READ → SD Card (offline) ---");
+  float alpha = SOIL_ALPHA;
+  if (lastSoilRaw >= 0) {
+    int deltaAdc = lastSoilRaw - soilMedianRaw;
+    if (deltaAdc >= 100) {
+      alpha = 0.8f;
     }
-
-   Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%d%% Flow=%.3f Vol=%.3f\n",
-              t, h, p, lux, soilMedian, flowRateLMin, totalVolumeL);
-
-    lastSend = millis();
   }
+
+  if (!soilFilteredInit) {
+    soilFilteredRaw = (float)soilMedianRaw;
+    soilFilteredInit = true;
+  } else {
+    soilFilteredRaw = alpha * (float)soilMedianRaw + (1.0f - alpha) * soilFilteredRaw;
+  }
+
+  lastSoilRaw = soilMedianRaw;
+
+  float soilPercent = mapSoilPercentF(soilFilteredRaw);
+  soilPercent = roundf(soilPercent * 100.0f) / 100.0f;
+
+  float t   = bme.readTemperature();
+  float h   = bme.readHumidity();
+  float p   = bme.readPressure() / 100.0F;
+  float lux = readLight();
+
+  time_t   nowEpoch = time(nullptr);
+  struct tm ti;
+  localtime_r(&nowEpoch, &ti);
+  char dt[20];
+  strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M:%S", &ti);
+
+  if (!offlineMode && Firebase.ready()) {
+    sendToFirebase(t, h, p, lux, soilPercent, dt, nowEpoch);
+    Serial.println("--- Gửi Firebase ---");
+  } else {
+    saveToSD(t, h, p, lux, soilPercent,
+             flowRateLMin, totalVolumeL, dt);
+    Serial.println("--- 💾 READ → SD Card (offline) ---");
+  }
+
+  Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3f Vol=%.3f\n",
+                t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
+
+  lastSend = millis();
+}
 
   delay(1000);
 }
