@@ -75,12 +75,21 @@ const int AirValue   = 3000;
 const int WaterValue = 1750;
 const int SensorPin  = 34;
 
-int soilMoistureValue  = 0;
-int soilmoisturepercent = 0;
-const float SOIL_ALPHA = 0.2f;
-float soilFilteredRaw = 0.0f;
-bool  soilFilteredInit = false;
-int   lastSoilRaw = -1;
+// ===== SOIL SMA FILTER =====
+const int           SMA_WINDOW       = 10;
+const unsigned long SOIL_SAMPLE_MS   = 30000UL;  // 30 giây / mẫu
+float               soilSmaBuffer[SMA_WINDOW];    // circular buffer
+int                 soilSmaIndex     = 0;          // vị trí ghi tiếp theo
+int                 soilSmaCount     = 0;          // số mẫu hợp lệ (0..10)
+unsigned long       lastSoilSampleMs = 0;
+
+// ===== SOIL LPF (First-Order Low Pass Filter) =====
+// y[n] = α·x[n] + (1-α)·y[n-1]
+const float LPF_ALPHA  = 0.2f;   // α=0.2 → tin 20% SMA mới, 80% lịch sử cũ (rất mượt)
+float       lpfSoilPct = -1.0f;  // -1 = chưa khởi tạo
+
+bool servicesInited = false;
+
 // ===== FLOW =====
 const int   FLOW_PIN           = 33;
 const float CALIBRATION_FACTOR = 98.0;
@@ -98,7 +107,7 @@ WebServer server(80);
 char ssid[32];
 char pass[32];
 
-// ===================== SOIL MEDIAN(9) + 5m SEND =====================
+// ===================== SOIL SMA(10×30s) + LPF + 5m SEND =====================
 const unsigned long SEND_WINDOW_MS   = 300000;
 
 void saveCredentials(const char* newSSID, const char* newPass)
@@ -195,16 +204,26 @@ bool connectWiFi()
   return WiFi.status() == WL_CONNECTED;
 }
 
-// [SỬA] initWiFi không còn block — nếu fail thì chạy offline
 void initWiFi()
 {
-  if (readCredentials() && connectWiFi()) {
+  if (!readCredentials()) {
+    // Chưa có thông tin WiFi → mở portal để người dùng nhập
+    Serial.println("⚠️  Chưa có thông tin WiFi → Mở AP Portal...");
+    Serial.println("    Kết nối WiFi: ESP32_IRRIGATION");
+    Serial.println("    Truy cập:     http://192.168.4.1");
+    startPortal(); // block tại đây, ESP32 restart sau khi lưu
+  }
+
+  // Có thông tin → thử kết nối
+  Serial.print("📡 Đang kết nối WiFi: ");
+  Serial.println(ssid);
+  if (connectWiFi()) {
     Serial.println("✅ WiFi OK: " + WiFi.localIP().toString());
     offlineMode = false;
   } else {
     Serial.println("⚠️  WiFi FAIL → chế độ OFFLINE");
     Serial.println("    Dữ liệu sẽ lưu vào SD Card.");
-    Serial.println("    Reset ESP32 sau khi cài WiFi để kết nối lại.");
+    Serial.println("    Reset EEPROM để cấu hình WiFi mới nếu cần.");
     offlineMode = true;
   }
   yield();
@@ -353,26 +372,21 @@ int readSoilRaw()
   return analogRead(SensorPin);
 }
 
-int readSoilMedianRaw9()
+// Thêm 1 mẫu vào SMA buffer (gọi mỗi 30 giây)
+void soilSmaPush(float pct)
 {
-  int values[9];
-  for (int i = 0; i < 9; i++) {
-    values[i] = readSoilRaw();
-    if (i < 8) delay(100);
-    yield();
-  }
+  soilSmaBuffer[soilSmaIndex] = pct;
+  soilSmaIndex = (soilSmaIndex + 1) % SMA_WINDOW;
+  if (soilSmaCount < SMA_WINDOW) soilSmaCount++;
+}
 
-  for (int i = 1; i < 9; i++) {
-    int key = values[i];
-    int j = i - 1;
-    while (j >= 0 && values[j] > key) {
-      values[j + 1] = values[j];
-      j--;
-    }
-    values[j + 1] = key;
-  }
-
-  return values[4];
+// Tính trung bình SMA từ các mẫu hợp lệ
+float getSoilSMA()
+{
+  if (soilSmaCount == 0) return 0.0f;
+  float sum = 0.0f;
+  for (int i = 0; i < soilSmaCount; i++) sum += soilSmaBuffer[i];
+  return sum / soilSmaCount;
 }
 
 float mapSoilPercentF(float soilRaw)
@@ -403,7 +417,15 @@ void initFirebase()
 void sendToFirebase(float t, float h, float p, float lux,
                    float soil, const char* datetime, time_t nowEpoch)
 {
-  String path = "/He_thong_tuoi/sensors/data/" + String(nowEpoch);
+  // Lấy ngày từ datetime (format: "YYYY-MM-DD HH:MM:SS")
+  char dateKey[11];
+  strncpy(dateKey, datetime, 10);
+  dateKey[10] = '\0';
+
+  String path = "/He_thong_tuoi/sensors/data/";
+  path += dateKey;
+  path += "/";
+  path += String(nowEpoch);
 
   FirebaseJson json;
   json.set("temperature",    t);
@@ -435,7 +457,7 @@ void setup()
   initI2C();
   initLight();
   initBME280();
-  Serial.println("✅ Cảm biến OK");
+  Serial.println(" Cảm biến ");
 
   // 3. SD Card — fallback storage khi mất WiFi
   initSD();
@@ -445,14 +467,17 @@ void setup()
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
-  // 5. Online services — chỉ khởi tạo khi có WiFi
+  // 5. MQTT config không cần WiFi — luôn khởi tạo
+  initMqtt();
+
+  // 6. Online services — chỉ khởi tạo khi có WiFi
   if (!offlineMode) {
     initFirebase();
-    initMqtt();
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Serial.println("✅ Firebase + MQTT + NTP OK");
+    servicesInited = true;
+    Serial.println("✅ Firebase + NTP OK");
   } else {
-    Serial.println("ℹ️  Chạy offline — bỏ qua Firebase/MQTT/NTP");
+    Serial.println("⚠️ Chạy offline — bỏ qua Firebase/NTP");
   }
 }
 
@@ -467,6 +492,14 @@ void loop()
 
   // --- Cập nhật trạng thái offlineMode ---
   offlineMode = (WiFi.status() != WL_CONNECTED);
+
+  // --- Khởi tạo Firebase + NTP lần đầu khi WiFi vừa kết nối lại ---
+  if (!offlineMode && !servicesInited) {
+    initFirebase();
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    servicesInited = true;
+    Serial.println("✅ WiFi khôi phục → Firebase + NTP OK");
+  }
 
   // --- MQTT ---
   if (!offlineMode) {
@@ -496,59 +529,59 @@ void loop()
     interrupts();
 
     float freq    = pulses / (elapsed / 1000.0);
-    flowRateLMin  = freq / CALIBRATION_FACTOR;
-    totalVolumeL += pulses / (CALIBRATION_FACTOR * 60.0);
-  }
-
-  // --- READ BME/BH1750 ONCE + SOIL MEDIAN(9) mỗi 5 phút ---
-if (millis() - lastSend >= SEND_WINDOW_MS) {
-  int soilMedianRaw = readSoilMedianRaw9();
-
-  float alpha = SOIL_ALPHA;
-  if (lastSoilRaw >= 0) {
-    int deltaAdc = lastSoilRaw - soilMedianRaw;
-    if (deltaAdc >= 100) {
-      alpha = 0.8f;
+    // Chỉ tính flow/volume khi relay đang ON → tránh nhiễu khi chân GPIO float
+    if (relayOn) {
+      flowRateLMin  = freq / CALIBRATION_FACTOR;
+      totalVolumeL += pulses / (CALIBRATION_FACTOR * 60.0);
+    } else {
+      flowRateLMin = 0.0;
     }
   }
 
-  if (!soilFilteredInit) {
-    soilFilteredRaw = (float)soilMedianRaw;
-    soilFilteredInit = true;
-  } else {
-    soilFilteredRaw = alpha * (float)soilMedianRaw + (1.0f - alpha) * soilFilteredRaw;
+  // --- SOIL SMA: lấy 1 mẫu mỗi 30 giây (non-blocking) ---
+  if (millis() - lastSoilSampleMs >= SOIL_SAMPLE_MS) {
+    lastSoilSampleMs = millis();
+    float rawPct = mapSoilPercentF((float)readSoilRaw());
+    soilSmaPush(rawPct);
+    Serial.printf("[SMA] Mẫu %d/%d: %.2f%%\n", soilSmaCount, SMA_WINDOW, rawPct);
   }
 
-  lastSoilRaw = soilMedianRaw;
+  // --- Gửi dữ liệu mỗi 5 phút ---
+  if (millis() - lastSend >= SEND_WINDOW_MS) {
+    // Bước 1: SMA — trung bình 10 mẫu x 30s
+    float smaSoil = getSoilSMA();
 
-  float soilPercent = mapSoilPercentF(soilFilteredRaw);
-  soilPercent = roundf(soilPercent * 100.0f) / 100.0f;
+    // Bước 2: LPF — y[n] = α·x[n] + (1-α)·y[n-1]  (α=0.8)
+    if (lpfSoilPct < 0.0f) lpfSoilPct = smaSoil;  // seed lần đầu
+    else lpfSoilPct = LPF_ALPHA * smaSoil + (1.0f - LPF_ALPHA) * lpfSoilPct;
 
-  float t   = bme.readTemperature();
-  float h   = bme.readHumidity();
-  float p   = bme.readPressure() / 100.0F;
-  float lux = readLight();
+    float soilPercent = roundf(lpfSoilPct * 100.0f) / 100.0f;
 
-  time_t   nowEpoch = time(nullptr);
-  struct tm ti;
-  localtime_r(&nowEpoch, &ti);
-  char dt[20];
-  strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M:%S", &ti);
+    float t   = bme.readTemperature();
+    float h   = bme.readHumidity();
+    float p   = bme.readPressure() / 100.0F;
+    float lux = readLight();
 
-  if (!offlineMode && Firebase.ready()) {
-    sendToFirebase(t, h, p, lux, soilPercent, dt, nowEpoch);
-    Serial.println("--- Gửi Firebase ---");
-  } else {
-    saveToSD(t, h, p, lux, soilPercent,
-             flowRateLMin, totalVolumeL, dt);
-    Serial.println("--- 💾 READ → SD Card (offline) ---");
+    time_t   nowEpoch = time(nullptr);
+    struct tm ti;
+    localtime_r(&nowEpoch, &ti);
+    char dt[20];
+    strftime(dt, sizeof(dt), "%Y-%m-%d %H:%M:%S", &ti);
+
+    if (!offlineMode && Firebase.ready()) {
+      sendToFirebase(t, h, p, lux, soilPercent, dt, nowEpoch);
+      Serial.println("--- Gửi Firebase ---");
+    } else {
+      saveToSD(t, h, p, lux, soilPercent,
+               flowRateLMin, totalVolumeL, dt);
+      Serial.println("--- 💾 SD Card (offline) ---");
+    }
+
+    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil(SMA)=%.2f%% Flow=%.3f Vol=%.3f\n",
+                  t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
+
+    lastSend = millis();
   }
-
-  Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3f Vol=%.3f\n",
-                t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
-
-  lastSend = millis();
-}
 
   delay(1000);
 }
