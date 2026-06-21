@@ -5,6 +5,9 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include <LoRa.h>
 #include <ArduinoJson.h>
 #include <FirebaseESP32.h>
@@ -28,9 +31,9 @@
 #define MQTT_PORT 8883
 #define MQTT_USER "quang"
 #define MQTT_PASS "12052004"
-#define MQTT_TOPIC_PUMP "irrigation/control/pump"
-#define MQTT_TOPIC_TIME "irrigation/control/time"
-#define MQTT_TOPIC_STATUS "irrigation/status/pump"
+#define MQTT_TOPIC_PUMP "irrigation/device1/control/pump"
+#define MQTT_TOPIC_TIME "irrigation/device1/control/time"
+#define MQTT_TOPIC_STATUS "irrigation/device1/status/pump"
 
 //  FIREBASE 
 FirebaseData fbdo;
@@ -41,9 +44,8 @@ FirebaseConfig config;
 WiFiClientSecure mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
 
-bool pumpOn = false;                // trạng thái bơm (dùng để publish MQTT status)
-unsigned long relayDurationMs = 0;  // thời gian bơm chạy (ms)
-
+bool pumpOn = false;              
+unsigned long relayDurationMs = 0; 
 unsigned long lastMqttAttemptMs = 0;
 const unsigned long MQTT_RECONNECT_MS = 5000;
 
@@ -51,6 +53,141 @@ unsigned long lastWiFiAttemptMs = 0;
 const unsigned long WIFI_RECONNECT_MS = 5000;
 
 bool offlineMode = false;
+
+// ===== OLED CONFIG & LATEST SENSOR DATA =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+float latestTemp = -1.0f;
+float latestHum  = -1.0f;
+float latestSoil = -1.0f;
+float latestLux  = -1.0f;
+
+unsigned long lastOledUpdateMs = 0;
+const unsigned long OLED_UPDATE_INTERVAL_MS = 1000;
+
+void initOLED() {
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("❌ OLED SSD1306 khởi tạo thất bại!"));
+  } else {
+    Serial.println(F("✅ OLED SSD1306 OK"));
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+    display.setCursor(6, 18);
+    display.println("GATEWAY STARTING...");
+    display.display();
+  }
+}
+
+String getDisplayTimeString() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo) && timeinfo.tm_year > 70) {
+    char buffer[22];
+    snprintf(buffer, sizeof(buffer), "%02d/%02d/%04d %02d:%02d:%02d",
+             timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    return String(buffer);
+  }
+  return "--/--/---- --:--:--";
+}
+
+void updateOLEDDisplay() {
+  display.clearDisplay();
+  
+  // Khung viền xung quanh màn hình
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  
+  // Header: Trạng thái kết nối
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(6, 2);
+  
+  String wifiStat = "OFF";
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiStat = "CON";
+  }
+  String mqttStat = mqttClient.connected() ? "OK" : "--";
+  
+  char header[22];
+  snprintf(header, sizeof(header), "GW MON  [W:%s M:%s]", wifiStat.c_str(), mqttStat.c_str());
+  display.print(header);
+  
+  // Đường kẻ ngang phân tách Header
+  display.drawFastHLine(4, 11, 120, SSD1306_WHITE);
+  
+  // Hiển thị tất cả thông số trên một màn hình duy nhất
+  // Sử dụng 2 cột để chứa đủ các thông số
+  
+  // 1. Cột 1: Nhiệt độ & Độ ẩm
+  display.setCursor(6, 15);
+  display.print("T: ");
+  if (latestTemp < 0.0f) {
+    display.print("--.-");
+  } else {
+    display.print(latestTemp, 1);
+  }
+  display.write(247); // Ký tự độ C
+  display.print("C");
+
+  display.setCursor(68, 15);
+  display.print("H: ");
+  if (latestHum < 0.0f) {
+    display.print("--.-");
+  } else {
+    display.print(latestHum, 1);
+  }
+  display.print("%");
+
+  // 2. Cột 2: Độ ẩm đất & Ánh sáng (Lux)
+  display.setCursor(6, 27);
+  display.print("S: ");
+  if (latestSoil < 0.0f) {
+    display.print("--.-");
+  } else {
+    display.print(latestSoil, 1);
+  }
+  display.print("%");
+
+  display.setCursor(68, 27);
+  display.print("L: ");
+  if (latestLux < 0.0f) {
+    display.print("---");
+  } else {
+    display.print((int)latestLux);
+  }
+  display.print(" lx");
+
+  // 3. Trạng thái bơm (được đưa ra giữa dòng)
+  char pumpStr[25];
+  if (pumpOn) {
+    if (relayDurationMs > 0) {
+      snprintf(pumpStr, sizeof(pumpStr), "Pump: ON (T)");
+    } else {
+      snprintf(pumpStr, sizeof(pumpStr), "Pump: ON");
+    }
+  } else {
+    snprintf(pumpStr, sizeof(pumpStr), "Pump: OFF");
+  }
+  int pumpX = (128 - (strlen(pumpStr) * 6)) / 2;
+  display.setCursor(pumpX, 39);
+  display.print(pumpStr);
+  
+  // Đường kẻ ngang phân tách Footer
+  display.drawFastHLine(4, 50, 120, SSD1306_WHITE);
+  
+  // Footer: Hiển thị thời gian đồng bộ từ NTP Server (được căn giữa)
+  String timeStr = getDisplayTimeString();
+  int timeX = (128 - (timeStr.length() * 6)) / 2;
+  display.setCursor(timeX, 53);
+  display.print(timeStr);
+  
+  display.display();
+}
 
 // ===== NTP =====
 const char* ntpServer = "pool.ntp.org";
@@ -128,6 +265,28 @@ void startPortal() {
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
   Serial.println("📶 AP Portal chạy tại 192.168.4.1 (SSID: ESP32_GATEWAY)");
+  
+  // Hiển thị thông báo Captive Portal lên màn hình OLED
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 64, SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(6, 4);
+  display.print("   WIFI PORTAL");
+  display.drawFastHLine(4, 14, 120, SSD1306_WHITE);
+  
+  display.setCursor(6, 18);
+  display.print("SSID: ESP32_GATEWAY");
+  display.setCursor(6, 29);
+  display.print("IP  : 192.168.4.1");
+  display.setCursor(6, 40);
+  display.print("Configure WiFi...");
+  
+  display.drawFastHLine(4, 51, 120, SSD1306_WHITE);
+  display.setCursor(6, 54);
+  display.print("AP Mode Active");
+  display.display();
+
   while (true) {
     server.handleClient();
     delay(2);
@@ -151,7 +310,7 @@ void initWiFi() {
     offlineMode = false;
   } else {
     Serial.println("⚠️  Không kết nối được WiFi → mở Portal để cài đặt...");
-    startPortal();  // block mãi đến khi user nhập WiFi và ESP32 restart
+    startPortal(); 
   }
 }
 
@@ -162,11 +321,13 @@ void initLoRa() {
     Serial.println("❌ LoRa khởi tạo thất bại! Kiểm tra kết nối dây.");
     while (true) { delay(1000); }
   }
-  LoRa.setSpreadingFactor(9);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
+  LoRa.setSpreadingFactor(12);                     // SF12: tầm xa tối đa
+  LoRa.setSignalBandwidth(125E3);                   // BW125kHz
+  LoRa.setCodingRate4(8);                           // CR4/8: chống nhiễu tốt nhất
+  LoRa.setTxPower(18, PA_OUTPUT_PA_BOOST_PIN);      // 18dBm — max theo spec module phần cứng
+  LoRa.setPreambleLength(12);                       // Preamble dài hơn để bắt sóng dễ hơn
   LoRa.enableCrc();
-  Serial.println("✅ LoRa OK (433MHz, SF9, BW125, CR4/5)");
+  Serial.println("✅ LoRa OK (433MHz, SF12, BW125, CR4/8, 18dBm)");
 }
 
 //  FIREBASE
@@ -180,7 +341,8 @@ void initFirebase() {
 void sendToFirebase(float t, float h, float p, float lux,
                     float soil, float flow, float vol,
                     const char* datetime, time_t nowEpoch) {
-  String path = "/He_thong_tuoi/sensors/data/" + String(nowEpoch);
+  const char* nameDevice = "device1";
+  String path = "He_thong_tuoi/sensor/" + String(nameDevice) + "/data/" + String(nowEpoch);
 
   FirebaseJson json;
   json.set("temperature", t);
@@ -203,25 +365,23 @@ void sendToFirebase(float t, float h, float p, float lux,
 //  GỬI LỆNH BƠM QUA LORA → LORA_SEND
 void sendPumpCommand(const char* state, long durSeconds) {
   StaticJsonDocument<128> doc;
-  doc["cmd"] = "PUMP";
+  doc["cmd"]   = "PUMP";
   doc["state"] = state;
-  doc["dur"] = durSeconds;
+  doc["dur"]   = durSeconds;
 
   String payload;
   serializeJson(doc, payload);
 
   LoRa.beginPacket();
   LoRa.print(payload);
-  LoRa.endPacket(true);  // async=true → không block
+  LoRa.endPacket(true);  // async=true — không block
 
   Serial.print("📡 LoRa → lệnh bơm: ");
   Serial.println(payload);
 
-  // Cập nhật trạng thái bơm và publish MQTT status
-  pumpOn = (strcmp(state, "ON") == 0);
-  if (mqttClient.connected()) {
-    mqttClient.publish(MQTT_TOPIC_STATUS, pumpOn ? "ON" : "OFF", true);
-  }
+  // Không publish MQTT status ở đây.
+  // Status sẽ được publish sau khi nhận ACK từ lora_send.
+  pumpOn = (strcmp(state, "ON") == 0);  // cập nhật củc bộ để tham khảo
 }
 
 //  MQTT CALLBACK — nhận lệnh từ app, forward qua LoRa
@@ -276,10 +436,7 @@ void mqttConnect() {
     Serial.println(mqttClient.state());
   }
 }
-
-// ===================================================================
-//  NHẬN DATA CẢM BIẾN TỪ LORA_SEND → GỬI FIREBASE
-// ===================================================================
+//  NHẬN DATA CẢM BIẾN HOẶC ACK TỪ LORA_SEND
 void checkLoRaData() {
   int packetSize = LoRa.parsePacket();
   if (packetSize == 0) return;
@@ -290,7 +447,7 @@ void checkLoRaData() {
   }
 
   int rssi = LoRa.packetRssi();
-  Serial.print("📥 LoRa ← sensor data (RSSI=");
+  Serial.print("📥 LoRa ← (RSSI=");
   Serial.print(rssi);
   Serial.print("dBm): ");
   Serial.println(received);
@@ -303,13 +460,33 @@ void checkLoRaData() {
     return;
   }
 
-  float t = doc["t"] | 0.0f;
-  float h = doc["h"] | 0.0f;
-  float p = doc["p"] | 0.0f;
-  float lux = doc["lux"] | 0.0f;
-  float soil = doc["soil"] | 0.0f;
+  // --- Xử LÝ ACK trạng thái bơm từ lora_send ---
+  if (doc.containsKey("ack") && strcmp(doc["ack"] | "", "PUMP") == 0) {
+    const char* st = doc["state"] | "OFF";
+    pumpOn = (strcmp(st, "ON") == 0);
+    Serial.print("✅ ACK bơm nhận được: ");
+    Serial.println(st);
+    if (mqttClient.connected()) {
+      mqttClient.publish(MQTT_TOPIC_STATUS, st, true);
+      Serial.print("📤 MQTT publish status: ");
+      Serial.println(st);
+    }
+    return;  // không xử lý tiếp
+  }
+
+  // --- Xử LÝ DATA cảm biến từ lora_send ---
+  float t    = doc["t"]    | -1.0f;
+  float h    = doc["h"]    | -1.0f;
+  float p    = doc["p"]    | -1.0f;
+  float lux  = doc["lux"]  | -1.0f;
+  float soil = doc["soil"] | -1.0f;
   float flow = doc["flow"] | 0.0f;
-  float vol = doc["vol"] | 0.0f;
+  float vol  = doc["vol"]  | 0.0f;
+
+  latestTemp = t;
+  latestHum  = h;
+  latestSoil = soil;
+  latestLux  = lux;
 
   Serial.printf("   T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
                 t, h, p, lux, soil, flow, vol);
@@ -331,6 +508,10 @@ void setup() {
   Serial.begin(115200);
   EEPROM.begin(512);
 
+  // Khởi tạo I2C và màn hình OLED
+  Wire.begin(21, 22);
+  initOLED();
+
   // WiFi
   initWiFi();
   WiFi.setAutoReconnect(true);
@@ -350,13 +531,11 @@ void setup() {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     Serial.println("✅ Firebase + MQTT + NTP OK");
   } else {
-    Serial.println("ℹ️  Offline — bỏ qua Firebase/MQTT/NTP");
+    Serial.println(" Offline — bỏ qua Firebase/MQTT/NTP");
   }
 }
 
-// ===================================================================
 //  LOOP
-// ===================================================================
 void loop() {
   // --- WiFi tự kết nối lại khi mất ---
   if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiAttemptMs >= WIFI_RECONNECT_MS) {
@@ -375,9 +554,13 @@ void loop() {
     }
     mqttClient.loop();
   }
-
-  // --- Nhận data cảm biến từ lora_send → gửi Firebase ---
   checkLoRaData();
+
+  // --- Cập nhật màn hình OLED mỗi giây ---
+  if (millis() - lastOledUpdateMs >= OLED_UPDATE_INTERVAL_MS) {
+    lastOledUpdateMs = millis();
+    updateOLEDDisplay();
+  }
 
   yield();
   delay(10);
