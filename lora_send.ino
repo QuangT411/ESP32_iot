@@ -15,8 +15,6 @@
 #define LORA_FREQ  433E6
 
 // ===== SD CARD =====
-// Dùng CS riêng (pin 4) để tránh xung đột với LoRa NSS (pin 5)
-// Kết nối: MOSI=23, MISO=19, SCK=18, CS=4
 #define SD_CS_PIN  4
 bool sdAvailable = false;
 
@@ -29,10 +27,14 @@ bool sdAvailable = false;
 const int AirValue   = 3000;
 const int WaterValue = 1750;
 const int SensorPin  = 34;
-const float SOIL_ALPHA = 0.2f;
-float soilFilteredRaw = 0.0f;
-bool  soilFilteredInit = false;
-int   lastSoilRaw = -1;
+
+// ===== SOIL SMA FILTER =====
+const int           SMA_WINDOW     = 10;
+const unsigned long SOIL_SAMPLE_MS = 30000UL; 
+float               soilSmaBuffer[SMA_WINDOW];
+int                 soilSmaIndex   = 0;
+int                 soilSmaCount   = 0;
+unsigned long       lastSoilSampleMs = 0;
 
 // ===== FLOW METER =====
 const int   FLOW_PIN           = 27;
@@ -57,11 +59,8 @@ BH1750  lightMeter;
 
 // ===== SEND =====
 unsigned long lastSendMs   = 0;
-const unsigned long SEND_WINDOW_MS   = 300000;  // 5 phút
+const unsigned long SEND_WINDOW_MS   = 300000;  
 
-// ===================================================================
-//  SOIL MEDIAN(9) — raw -> median -> map
-// ===================================================================
 int readSoilRaw()
 {
   return analogRead(SensorPin);
@@ -73,31 +72,24 @@ float mapSoilPercentF(float soilRaw)
   return constrain(pct, 0.0f, 100.0f);
 }
 
-int readSoilMedianRaw9()
+// Thêm 1 mẫu vào SMA buffer (gọi mỗi 30 giây)
+void soilSmaPush(float pct)
 {
-  int values[9];
-  for (int i = 0; i < 9; i++) {
-    values[i] = readSoilRaw();
-    if (i < 8) delay(100);
-  }
-
-  for (int i = 1; i < 9; i++) {
-    int key = values[i];
-    int j = i - 1;
-    while (j >= 0 && values[j] > key) {
-      values[j + 1] = values[j];
-      j--;
-    }
-    values[j + 1] = key;
-  }
-
-  return values[4];
+  soilSmaBuffer[soilSmaIndex] = pct;
+  soilSmaIndex = (soilSmaIndex + 1) % SMA_WINDOW;
+  if (soilSmaCount < SMA_WINDOW) soilSmaCount++;
 }
 
+// Tính trung bình SMA từ các mẫu hợp lệ
+float getSoilSMA()
+{
+  if (soilSmaCount == 0) return 0.0f;
+  float sum = 0.0f;
+  for (int i = 0; i < soilSmaCount; i++) sum += soilSmaBuffer[i];
+  return sum / soilSmaCount;
+}
 
-// ===================================================================
 //  SD CARD
-// ===================================================================
 void initSD()
 {
   if (SD.begin(SD_CS_PIN)) {
@@ -139,9 +131,7 @@ void saveToSD(float t, float h, float p, float lux, float soil,
   Serial.println("💾 SD lưu OK");
 }
 
-// ===================================================================
 //  LoRa INIT
-// ===================================================================
 void initLoRa()
 {
   LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
@@ -149,16 +139,16 @@ void initLoRa()
     Serial.println("❌ LoRa khởi tạo thất bại! Kiểm tra kết nối dây.");
     while (true) { delay(1000); }
   }
-  LoRa.setSpreadingFactor(9);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
+  LoRa.setSpreadingFactor(12);                     // SF12: tầm xa tối đa
+  LoRa.setSignalBandwidth(125E3);                   // BW125kHz
+  LoRa.setCodingRate4(8);                           // CR4/8: chống nhiễu tốt nhất
+  LoRa.setTxPower(18, PA_OUTPUT_PA_BOOST_PIN);      // 18dBm — max theo spec module phần cứng
+  LoRa.setPreambleLength(12);                       // Preamble dài hơn để bắt sóng dễ hơn
   LoRa.enableCrc();
-  Serial.println("✅ LoRa OK (433MHz, SF9, BW125, CR4/5)");
+  Serial.println("✅ LoRa OK (433MHz, SF12, BW125, CR4/8, 18dBm)");
 }
 
-// ===================================================================
 //  RELAY
-// ===================================================================
 void setRelayState(bool on)
 {
   relayOn = on;
@@ -175,9 +165,25 @@ void setRelayState(bool on)
   }
 }
 
-// ===================================================================
+//  GỬI ACK TRẠNG THÁI BƠM VỀ LORA_RECEIVE
+void sendPumpAck(bool on)
+{
+  StaticJsonDocument<128> doc;
+  doc["ack"]   = "PUMP";
+  doc["state"] = on ? "ON" : "OFF";
+
+  String payload;
+  serializeJson(doc, payload);
+
+  LoRa.beginPacket();
+  LoRa.print(payload);
+  LoRa.endPacket();  // blocking — chờ TX xong hẳn rồi mới return
+
+  Serial.print("📡 LoRa → ACK bơm: ");
+  Serial.println(payload);
+}
+
 //  GỬI DATA CẢM BIẾN QUA LORA
-// ===================================================================
 void sendSensorData(float t, float h, float p, float lux, float soil)
 {
   StaticJsonDocument<256> doc;
@@ -232,16 +238,15 @@ void checkLoRaCommand()
 
   relayDurationMs = (dur > 0) ? (unsigned long)dur * 1000UL : 0;
 
-  if (strcmp(state, "ON") == 0) {
-    setRelayState(true);
-  } else {
-    setRelayState(false);
-  }
+  bool turnOn = (strcmp(state, "ON") == 0);
+  setRelayState(turnOn);
+
+  // Gửi ACK xác nhận trạng thái thực tế về gateway
+  delay(50);  // nhường bus LoRa trước khi TX
+  sendPumpAck(turnOn);
 }
 
-// ===================================================================
-//  SETUP
-// ===================================================================
+// SET UP
 void setup()
 {
   Serial.begin(115200);
@@ -259,7 +264,6 @@ void setup()
   if (!bme.begin(0x76)) {
     Serial.println("⚠️  BME280 không tìm thấy (kiểm tra địa chỉ I2C)");
   }
-  Serial.println("✅ Cảm biến OK (BME280 + BH1750 + Soil + Flow)");
 
   // SD Card
   initSD();
@@ -296,34 +300,28 @@ void loop()
     pulseCount = 0;
     interrupts();
 
-    float freq    = pulses / (elapsed / 1000.0f);
-    flowRateLMin  = freq / CALIBRATION_FACTOR;
-    totalVolumeL += pulses / (CALIBRATION_FACTOR * 60.0f);
+    float freq   = pulses / (elapsed / 1000.0f);
+    // Chỉ tính flow/volume khi relay đang ON → tránh nhiễu khi chân GPIO float
+    if (relayOn) {
+      flowRateLMin  = freq / CALIBRATION_FACTOR;
+      totalVolumeL += pulses / (CALIBRATION_FACTOR * 60.0f);
+    } else {
+      flowRateLMin = 0.0f;
+    }
   }
 
-  // --- READ BME/BH1750 ONCE + SOIL MEDIAN(9) mỗi 5 phút ---
+  // --- SOIL SMA: lấy 1 mẫu mỗi 30 giây (non-blocking) ---
+  if (millis() - lastSoilSampleMs >= SOIL_SAMPLE_MS) {
+    lastSoilSampleMs = millis();
+    float rawPct = mapSoilPercentF((float)readSoilRaw());
+    soilSmaPush(rawPct);
+    Serial.printf("[SMA] Mẫu %d/%d: %.2f%%\n", soilSmaCount, SMA_WINDOW, rawPct);
+  }
+
+  // --- Gửi dữ liệu mỗi 5 phút ---
   if (millis() - lastSendMs >= SEND_WINDOW_MS) {
-    int soilMedianRaw = readSoilMedianRaw9();
-
-    float alpha = SOIL_ALPHA;
-    if (lastSoilRaw >= 0) {
-      int deltaAdc = lastSoilRaw - soilMedianRaw;
-      if (deltaAdc >= 100) {
-        alpha = 0.8f;
-      }
-    }
-
-    if (!soilFilteredInit) {
-      soilFilteredRaw = (float)soilMedianRaw;
-      soilFilteredInit = true;
-    } else {
-      soilFilteredRaw = alpha * (float)soilMedianRaw + (1.0f - alpha) * soilFilteredRaw;
-    }
-
-    lastSoilRaw = soilMedianRaw;
-
-    float soilPercent = mapSoilPercentF(soilFilteredRaw);
-    soilPercent = roundf(soilPercent * 100.0f) / 100.0f;
+    // SMA — trung bình 10 mẫu x 30s
+    float soilPercent = roundf(getSoilSMA() * 100.0f) / 100.0f;
 
     float t   = bme.readTemperature();
     float h   = bme.readHumidity();
@@ -333,10 +331,10 @@ void loop()
     sendSensorData(t, h, p, lux, soilPercent);
     saveToSD(t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
 
-    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
+    Serial.printf("T=%.2fC H=%.2f%% P=%.2fhPa Lux=%.2f Soil(SMA)=%.2f%% Flow=%.3fL/m Vol=%.3fL\n",
             t, h, p, lux, soilPercent, flowRateLMin, totalVolumeL);
 
-    lastSendMs  = millis();
+    lastSendMs = millis();
   }
 
   delay(10);
